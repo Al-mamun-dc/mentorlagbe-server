@@ -1,0 +1,781 @@
+import express from 'express';
+import { MongoClient, ObjectId } from 'mongodb';
+import "dotenv/config";
+import cors from "cors";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const app = express();
+const port = process.env.PORT || 4000;
+
+//midleware
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || /^http:\/\/(localhost|127\.0\.0\.1):3000$/.test(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+}));
+app.use(express.json());
+app.use((error, req, res, next) => {
+    if (error instanceof SyntaxError && "body" in error) {
+        return res.status(400).json({ error: "Invalid JSON body." });
+    }
+    return next(error);
+});
+const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-gewkcdw-shard-00-00.tlv5tmv.mongodb.net:27017,ac-gewkcdw-shard-00-01.tlv5tmv.mongodb.net:27017,ac-gewkcdw-shard-00-02.tlv5tmv.mongodb.net:27017/?ssl=true&replicaSet=atlas-6gpape-shard-0&authSource=admin`);
+
+export async function connectToMongoDB() {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+}
+
+let connectedClient;
+try {
+    connectedClient = await connectToMongoDB();
+} catch (error) {
+    console.error("Unable to start MentorLagbe backend: MongoDB is unavailable.", error);
+    process.exit(1);
+}
+const database = connectedClient.db("mentorlagbe");
+const user = database.collection("user");
+const tution = database.collection("tution");
+const session = database.collection("session");
+// Plans live separately so the existing user collection is never changed.
+const tutorPlan = database.collection("tutorPlan");
+// Student applications are stored separately from tuition posts.
+const application = database.collection("application");
+
+// One application per student per tuition, even if two requests arrive together.
+// If legacy duplicates exist, log the problem but keep the server available.
+try {
+    await application.createIndex(
+        { studentId: 1, tuitionId: 1 },
+        { unique: true, name: "studentId_1_tuitionId_1" }
+    );
+} catch (error) {
+    console.error("Unable to create application unique index:", error);
+}
+
+const FREE_POST_LIMIT = 2;
+
+function parseCookies(cookieHeader = "") {
+    const cookies = Object.create(null);
+
+    for (const part of cookieHeader.split(";")) {
+        const separatorIndex = part.indexOf("=");
+        if (separatorIndex < 0) continue;
+
+        const name = part.slice(0, separatorIndex).trim();
+        let value = part.slice(separatorIndex + 1).trim();
+
+        try {
+            value = decodeURIComponent(value);
+        } catch {
+            // Keep the raw value if it is not URL encoded.
+        }
+
+        cookies[name] = value;
+    }
+
+    return cookies;
+}
+
+/* Better Auth signs the session token with HMAC-SHA256 using BETTER_AUTH_SECRET. */
+function getSignedSessionToken(req) {
+    const secret = process.env.BETTER_AUTH_SECRET;
+    if (!secret) {
+        throw new Error("BETTER_AUTH_SECRET is not configured on the server.");
+    }
+
+    const signedCookie = parseCookies(req.headers.cookie)["better-auth.session_token"];
+    if (!signedCookie) return null;
+
+    const signatureStart = signedCookie.lastIndexOf(".");
+    if (signatureStart < 1) return null;
+
+    const token = signedCookie.slice(0, signatureStart);
+    const signature = signedCookie.slice(signatureStart + 1);
+    if (signature.length !== 44 || !signature.endsWith("=")) return null;
+
+    const expectedSignature = createHmac("sha256", secret).update(token).digest("base64");
+    const providedBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (
+        providedBuffer.length !== expectedBuffer.length ||
+        !timingSafeEqual(providedBuffer, expectedBuffer)
+    ) {
+        return null;
+    }
+
+    return token;
+}
+
+async function getAuthenticatedTutor(req) {
+    const token = getSignedSessionToken(req);
+    if (!token) return null;
+
+    const activeSession = await session.findOne({ token });
+    if (!activeSession) return null;
+
+    const expiresAt = new Date(activeSession.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        return null;
+    }
+
+    const userId = String(activeSession.userId);
+
+    let tutor;
+    try {
+        tutor = await user.findOne(
+            { _id: new ObjectId(userId) },
+            { projection: { name: 1, email: 1, role: 1 } }
+        );
+    } catch {
+        return null;
+    }
+
+    // Read the role only; the user document is never updated.
+    if (!tutor || tutor.role !== "tutor") return null;
+
+    return {
+        userId,
+        name: tutor.name || "",
+        email: tutor.email || "",
+    };
+}
+
+/* Shared session verification for non-tutor actions. The role is always read
+   from the authenticated user document, never from the request body. */
+async function getAuthenticatedUser(req) {
+    const token = getSignedSessionToken(req);
+    if (!token) return null;
+
+    const activeSession = await session.findOne({ token });
+    if (!activeSession) return null;
+
+    const expiresAt = new Date(activeSession.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        return null;
+    }
+
+    const userId = String(activeSession.userId);
+
+    let account;
+    try {
+        account = await user.findOne(
+            { _id: new ObjectId(userId) },
+            { projection: { name: 1, email: 1, role: 1 } }
+        );
+    } catch {
+        return null;
+    }
+
+    if (!account) return null;
+
+    return {
+        userId,
+        name: account.name || "",
+        email: account.email || "",
+        role: account.role || "",
+    };
+}
+
+function cleanText(value) {
+    return typeof value === "string" ? value.trim() : "";
+}
+
+function toIsoString(value) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function isValidBannerImageUrl(value) {
+    try {
+        const url = new URL(value);
+        return (url.protocol === "http:" || url.protocol === "https:") && Boolean(url.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function validateTuition(body, requireBannerImage = true) {
+    const errors = [];
+
+    const title = cleanText(body.title);
+    const subject = cleanText(body.subject);
+    const classLevel = cleanText(body.classLevel);
+    const mode = cleanText(body.mode);
+    const description = cleanText(body.description);
+    const bannerImage = cleanText(body.bannerImage);
+
+    if (!title) errors.push("Title is required.");
+    if (!subject) errors.push("Subject is required.");
+    if (!classLevel) errors.push("Class level is required.");
+    if (mode !== "online" && mode !== "offline") {
+        errors.push("Mode must be online or offline.");
+    }
+
+    const location = mode === "online" ? "Online" : cleanText(body.location);
+    if (mode === "offline" && !location) {
+        errors.push("Location is required for offline tuitions.");
+    }
+
+    const monthlyFee = Number(body.monthlyFee);
+    if (!Number.isFinite(monthlyFee) || monthlyFee <= 0) {
+        errors.push("Monthly fee must be greater than 0.");
+    }
+
+    const daysPerWeek = Number(body.daysPerWeek);
+    if (!Number.isInteger(daysPerWeek) || daysPerWeek < 1 || daysPerWeek > 7) {
+        errors.push("Days per week must be between 1 and 7.");
+    }
+
+    if (!description) errors.push("Description is required.");
+    if (requireBannerImage) {
+        if (!bannerImage) {
+            errors.push("Banner image is required.");
+        } else if (!isValidBannerImageUrl(bannerImage)) {
+            errors.push("Banner image must be a valid URL.");
+        }
+    }
+
+    return {
+        errors,
+        value: {
+            title,
+            subject,
+            classLevel,
+            mode,
+            location,
+            monthlyFee,
+            daysPerWeek,
+            description,
+            bannerImage,
+        },
+    };
+}
+
+app.get('/', (req, res) => {
+    res.send('hello');
+});
+
+app.get('/users', async (req, res) => {
+    const cursor = user.find({});
+    const result = await cursor.toArray();
+    res.send(result);
+
+});
+
+//tution post related api
+// Tuition search API
+app.get('/tution-post', async (req, res) => {
+    try {
+        const readQueryValue = (value) => {
+            if (Array.isArray(value)) value = value[0];
+            return typeof value === "string" ? value.trim() : "";
+        };
+
+        const query = {
+            approvalStatus: "approved",
+            isActive: true
+        };
+
+        const search = readQueryValue(req.query.search);
+        const subject = readQueryValue(req.query.subject);
+        const classLevel = readQueryValue(req.query.classLevel);
+        const mode = readQueryValue(req.query.mode).toLowerCase();
+
+        if (search) {
+            const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            query.$or = [
+                {
+                    title: {
+                        $regex: escapedSearch,
+                        $options: "i"
+                    }
+                },
+                {
+                    subject: {
+                        $regex: escapedSearch,
+                        $options: "i"
+                    }
+                }
+            ];
+        }
+
+        if (subject) query.subject = subject;
+        if (classLevel) query.classLevel = classLevel;
+        if (mode === "online" || mode === "offline") query.mode = mode;
+
+        const result = await tution.find(query).toArray();
+
+        res.status(200).send(result);
+
+    } catch (error) {
+        console.error("Search tuition failed:", error);
+        res.status(500).send({
+            error: "Failed to search tuitions."
+        });
+    }
+});
+
+// Tutor-scoped read used by the "My Tuitions" page.
+app.get('/tution-post/my', async (req, res) => {
+    try {
+        const tutor = await getAuthenticatedTutor(req);
+        if (!tutor) {
+            return res.status(401).json({ error: "Please sign in as a tutor." });
+        }
+
+        // Ownership comes only from the authenticated session. Match both the current
+        // string tutorId and legacy ObjectId/email variants so older own posts are
+        // not silently omitted. No approval, active, or tutor-status filter is used.
+        const tutorId = String(tutor.userId);
+        const ownerClauses = [{ tutorId }];
+
+        if (ObjectId.isValid(tutorId)) {
+            ownerClauses.push({ tutorId: new ObjectId(tutorId) });
+        }
+
+        const tutorEmail = cleanText(tutor.email);
+        if (tutorEmail) {
+            const escapedEmail = tutorEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            ownerClauses.push({
+                tutorEmail: { $regex: `^${escapedEmail}$`, $options: "i" }
+            });
+        }
+
+        const result = await tution.find({ $or: ownerClauses }).toArray();
+        res.status(200).json(result);
+    } catch (error) {
+        console.error("GET /tution-post/my failed:", error);
+        res.status(500).json({ error: "Failed to load tuitions." });
+    }
+});
+
+// Public tuition details. Kept after /tution-post/my so "my" is not treated as an id.
+app.get('/tution-post/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const isValidId = /^[0-9a-fA-F]{24}$/.test(id) && ObjectId.isValid(id);
+        if (!isValidId) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const doc = await tution.findOne({
+            _id: new ObjectId(id),
+            approvalStatus: "approved",
+            isActive: true
+        });
+
+        if (!doc) {
+            return res.status(404).json({ error: "Tuition not found." });
+        }
+
+        // Only public tutor fields are read and returned.
+        const tutorId = String(doc.tutorId || "");
+        let tutor = {
+            name: cleanText(doc.tutorName) || "MentorLagbe Tutor",
+            image: "",
+            role: "tutor",
+            joinedAt: null
+        };
+
+        if (/^[0-9a-fA-F]{24}$/.test(tutorId)) {
+            const tutorDoc = await user.findOne(
+                { _id: new ObjectId(tutorId) },
+                { projection: { name: 1, image: 1, role: 1, createdAt: 1 } }
+            );
+            if (tutorDoc) {
+                const image = cleanText(tutorDoc.image);
+                tutor = {
+                    name: cleanText(tutorDoc.name) || tutor.name,
+                    image: isValidBannerImageUrl(image) ? image : "",
+                    role: "tutor",
+                    joinedAt: tutorDoc.createdAt || null
+                };
+            }
+        }
+
+        const mode = cleanText(doc.mode) === "offline" ? "offline" : "online";
+        const monthlyFee = Number(doc.monthlyFee);
+        const rawDays = Number(doc.daysPerWeek);
+        const daysPerWeek =
+            Number.isInteger(rawDays) && rawDays >= 1 && rawDays <= 7 ? rawDays : 1;
+        const bannerImage = cleanText(doc.bannerImage);
+
+        res.status(200).json({
+            id: String(doc._id),
+            title: cleanText(doc.title),
+            subject: cleanText(doc.subject),
+            classLevel: cleanText(doc.classLevel),
+            mode,
+            location: mode === "offline" ? cleanText(doc.location) : "Online",
+            monthlyFee: Number.isFinite(monthlyFee) && monthlyFee > 0 ? monthlyFee : 0,
+            daysPerWeek,
+            schedule: `${daysPerWeek} ${daysPerWeek === 1 ? "day" : "days"} per week`,
+            description: cleanText(doc.description),
+            bannerImage: isValidBannerImageUrl(bannerImage) ? bannerImage : "",
+            createdAt: doc.createdAt || null,
+            tutor
+        });
+    } catch (error) {
+        console.error("GET /tution-post/:id failed:", error);
+        res.status(500).json({ error: "Failed to load tuition details." });
+    }
+});
+
+// Student application. Identity and role always come from the verified session.
+app.post('/tution-post/:id/apply', async (req, res) => {
+    try {
+        const applicant = await getAuthenticatedUser(req);
+        if (!applicant) {
+            return res.status(401).json({ error: "Please sign in to apply for a tuition." });
+        }
+        if (applicant.role !== "student") {
+            return res.status(403).json({ error: "Only students can apply for tuition." });
+        }
+
+        const { id } = req.params;
+        const isValidId = /^[0-9a-fA-F]{24}$/.test(id) && ObjectId.isValid(id);
+        if (!isValidId) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const tuitionDoc = await tution.findOne(
+            {
+                _id: new ObjectId(id),
+                approvalStatus: "approved",
+                isActive: true
+            },
+            { projection: { title: 1 } }
+        );
+        if (!tuitionDoc) {
+            return res.status(404).json({ error: "Tuition not found or no longer available." });
+        }
+
+        const phone = cleanText(req.body?.phone);
+        const preferredSchedule = cleanText(req.body?.preferredSchedule);
+        const learningNote = cleanText(req.body?.learningNote);
+
+        const errors = [];
+        if (!phone) errors.push("Phone is required.");
+        else if (phone.length > 50) errors.push("Phone must be 50 characters or fewer.");
+        if (!preferredSchedule) errors.push("Preferred schedule is required.");
+        else if (preferredSchedule.length > 200) {
+            errors.push("Preferred schedule must be 200 characters or fewer.");
+        }
+        if (learningNote.length > 2000) {
+            errors.push("Learning note must be 2000 characters or fewer.");
+        }
+        if (errors.length > 0) {
+            return res.status(400).json({ error: errors.join(" ") });
+        }
+
+        const duplicate = await application.findOne({
+            studentId: applicant.userId,
+            tuitionId: id
+        });
+        if (duplicate) {
+            return res.status(409).json({ error: "You have already applied for this tuition." });
+        }
+
+        // Tuition details are joined from the tution collection when read,
+        // so they are intentionally not duplicated in this document.
+        const applicationData = {
+            tuitionId: id,
+            studentId: applicant.userId,
+            studentName: applicant.name,
+            studentEmail: applicant.email,
+            phone,
+            preferredSchedule,
+            learningNote,
+            status: "pending",
+            createdAt: new Date()
+        };
+
+        let inserted;
+        try {
+            inserted = await application.insertOne(applicationData);
+        } catch (error) {
+            if (error && error.code === 11000) {
+                return res.status(409).json({ error: "You have already applied for this tuition." });
+            }
+            throw error;
+        }
+
+        res.status(201).json({
+            id: String(inserted.insertedId),
+            ...applicationData,
+            tuitionTitle: cleanText(tuitionDoc.title)
+        });
+    } catch (error) {
+        console.error("POST /tution-post/:id/apply failed:", error);
+        res.status(500).json({ error: "Failed to submit application." });
+    }
+});
+
+// Applications belonging to the authenticated student, joined with live tuition data.
+app.get('/application/my', async (req, res) => {
+    try {
+        const student = await getAuthenticatedUser(req);
+        if (!student) {
+            return res.status(401).json({ error: "Please sign in to view your applications." });
+        }
+        if (student.role !== "student") {
+            return res.status(403).json({ error: "Only students can view applications." });
+        }
+
+        const docs = await application
+            .find(
+                { studentId: student.userId },
+                { sort: { createdAt: -1 } }
+            )
+            .toArray();
+        const totalApplications = await application.countDocuments({
+            studentId: student.userId
+        });
+
+        const tuitionIds = [
+            ...new Set(
+                docs
+                    .map((doc) => String(doc.tuitionId || ""))
+                    .filter((id) => /^[0-9a-fA-F]{24}$/.test(id))
+            ),
+        ];
+
+        const tuitionDocs = tuitionIds.length
+            ? await tution
+                .find(
+                    { _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } },
+                    {
+                        projection: {
+                            title: 1,
+                            tutorName: 1,
+                            tutorEmail: 1,
+                            monthlyFee: 1,
+                        },
+                    }
+                )
+                .toArray()
+            : [];
+        const tuitionById = new Map(tuitionDocs.map((doc) => [String(doc._id), doc]));
+
+        const applications = docs.map((doc) => {
+            const tuitionId = String(doc.tuitionId || "");
+            const tuition = tuitionById.get(tuitionId);
+            const fee = Number(tuition?.monthlyFee);
+            const status = cleanText(doc.status);
+
+            return {
+                id: String(doc._id),
+                tuitionId,
+                tuitionTitle: cleanText(tuition?.title) || "Tuition unavailable",
+                tutorName: cleanText(tuition?.tutorName) || "Tutor information unavailable",
+                tutorEmail: cleanText(tuition?.tutorEmail) || "Not provided",
+                monthlyFee: Number.isFinite(fee) ? fee : 0,
+                appliedDate: toIsoString(doc.createdAt),
+                createdAt: toIsoString(doc.createdAt),
+                status: status === "accepted" || status === "rejected" ? status : "pending",
+                phone: cleanText(doc.phone),
+                preferredSchedule: cleanText(doc.preferredSchedule),
+                learningNote: cleanText(doc.learningNote),
+            };
+        });
+
+        res.status(200).json({
+            totalApplications,
+            applications
+        });
+    } catch (error) {
+        console.error("GET /application/my failed:", error);
+        res.status(500).json({ error: "Failed to load applications." });
+    }
+});
+
+// Students may cancel only their own pending applications.
+app.delete('/application/:id', async (req, res) => {
+    try {
+        const student = await getAuthenticatedUser(req);
+        if (!student) {
+            return res.status(401).json({ error: "Please sign in to cancel an application." });
+        }
+        if (student.role !== "student") {
+            return res.status(403).json({ error: "Only students can cancel applications." });
+        }
+
+        const { id } = req.params;
+        if (!/^[0-9a-fA-F]{24}$/.test(id) || !ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid application ID." });
+        }
+
+        const objectId = new ObjectId(id);
+        const existing = await application.findOne(
+            { _id: objectId, studentId: student.userId },
+            { projection: { status: 1 } }
+        );
+        if (!existing) {
+            return res.status(404).json({ error: "Application not found." });
+        }
+        if (existing.status !== "pending") {
+            return res.status(409).json({ error: "Only pending applications can be cancelled." });
+        }
+
+        const result = await application.deleteOne({
+            _id: objectId,
+            studentId: student.userId,
+            status: "pending",
+        });
+        if (result.deletedCount === 0) {
+            return res.status(409).json({ error: "Only pending applications can be cancelled." });
+        }
+
+        res.status(200).json({ message: "Application cancelled successfully." });
+    } catch (error) {
+        console.error("DELETE /application/:id failed:", error);
+        res.status(500).json({ error: "Failed to cancel application." });
+    }
+});
+
+app.post('/tution-post', async (req, res) => {
+    try {
+        const tutor = await getAuthenticatedTutor(req);
+        if (!tutor) {
+            return res.status(401).json({ error: "Please sign in as a tutor to post a tuition." });
+        }
+
+        const { errors, value } = validateTuition(req.body || {});
+        if (errors.length > 0) {
+            return res.status(400).json({ error: errors.join(" ") });
+        }
+
+        const planRecord = await tutorPlan.findOne({ userId: tutor.userId });
+        const plan = planRecord?.plan === "pro" ? "pro" : "free";
+
+        if (plan === "free") {
+            const postCount = await tution.countDocuments({ tutorId: tutor.userId });
+            if (postCount >= FREE_POST_LIMIT) {
+                return res.status(403).json({
+                    error: "Free plan allows a maximum of 2 tuition posts. Upgrade to Pro to post more.",
+                });
+            }
+        }
+
+        const now = new Date();
+        const tutionData = {
+            ...value,
+            approvalStatus: "pending",
+            tutorStatus: "active",
+            isActive: true,
+            tutorId: tutor.userId,
+            tutorName: tutor.name,
+            tutorEmail: tutor.email,
+            postingPlan: plan,
+            createdAt: now,
+            updatedAt: now,
+        };
+
+        const result = await tution.insertOne(tutionData);
+        res.status(201).json({ ...tutionData, _id: result.insertedId });
+    } catch (error) {
+        console.error("POST /tution-post failed:", error);
+        res.status(500).json({ error: "Failed to save tuition. Please try again." });
+    }
+})
+// Delete tuition post
+app.delete('/tution-post/:id', async (req, res) => {
+    try {
+        const tutor = await getAuthenticatedTutor(req);
+
+        if (!tutor) {
+            return res.status(401).json({
+                error: "Please sign in as a tutor."
+            });
+        }
+
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                error: "Invalid tuition ID."
+            });
+        }
+
+        const result = await tution.deleteOne({
+            _id: new ObjectId(id),
+            tutorId: tutor.userId
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                error: "Tuition not found or you are not the owner."
+            });
+        }
+
+        res.status(200).json({
+            message: "Tuition post deleted successfully."
+        });
+
+    } catch (error) {
+        console.error("Delete tuition failed:", error);
+
+        res.status(500).json({
+            error: "Failed to delete tuition."
+        });
+    }
+});
+
+
+app.patch('/tution-post/:id', async (req, res) => {
+    try {
+        const tutor = await getAuthenticatedTutor(req);
+        if (!tutor) {
+            return res.status(401).json({ error: "Please sign in as a tutor." });
+        }
+
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const objectId = new ObjectId(id);
+        const existing = await tution.findOne({
+            _id: objectId,
+            tutorId: tutor.userId
+        });
+
+        if (!existing) {
+            return res.status(404).json({
+                error: "Tuition not found or you are not the owner."
+            });
+        }
+
+        const { errors, value } = validateTuition(
+            { ...existing, ...req.body },
+            false
+        );
+        if (errors.length > 0) {
+            return res.status(400).json({ error: errors.join(" ") });
+        }
+
+        const { bannerImage: _bannerImage, ...updates } = value;
+        await tution.updateOne(
+            { _id: objectId, tutorId: tutor.userId },
+            { $set: { ...updates, updatedAt: new Date() } }
+        );
+
+        res.send({ message: "Tuition updated successfully." });
+
+    } catch (error) {
+        console.error("Update tuition failed:", error);
+        res.status(500).json({ error: "Failed to update tuition." });
+    }
+});
+
+app.listen(port, () => {
+    console.log(`mentorlagbe runing on port ${port}`);
+});

@@ -114,7 +114,9 @@ function getSignedSessionToken(req) {
     return token;
 }
 
-async function getAuthenticatedTutor(req) {
+/* Shared Better Auth session verification. Never trust frontend-supplied
+   userId/email/role; identity and role come from the verified session + DB. */
+async function getVerifiedSessionUser(req) {
     const token = getSignedSessionToken(req);
     if (!token) return null;
 
@@ -127,42 +129,9 @@ async function getAuthenticatedTutor(req) {
     }
 
     const userId = String(activeSession.userId);
-
-    let tutor;
-    try {
-        tutor = await user.findOne(
-            { _id: new ObjectId(userId) },
-            { projection: { name: 1, email: 1, role: 1 } }
-        );
-    } catch {
+    if (!/^[0-9a-fA-F]{24}$/.test(userId) || !ObjectId.isValid(userId)) {
         return null;
     }
-
-    // Read the role only; the user document is never updated.
-    if (!tutor || tutor.role !== "tutor") return null;
-
-    return {
-        userId,
-        name: tutor.name || "",
-        email: tutor.email || "",
-    };
-}
-
-/* Shared session verification for non-tutor actions. The role is always read
-   from the authenticated user document, never from the request body. */
-async function getAuthenticatedUser(req) {
-    const token = getSignedSessionToken(req);
-    if (!token) return null;
-
-    const activeSession = await session.findOne({ token });
-    if (!activeSession) return null;
-
-    const expiresAt = new Date(activeSession.expiresAt).getTime();
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-        return null;
-    }
-
-    const userId = String(activeSession.userId);
 
     let account;
     try {
@@ -178,10 +147,70 @@ async function getAuthenticatedUser(req) {
 
     return {
         userId,
-        name: account.name || "",
-        email: account.email || "",
-        role: account.role || "",
+        name: cleanText(account.name),
+        email: cleanText(account.email),
+        role: cleanText(account.role),
     };
+}
+
+async function verifyToken(req, res, next) {
+    try {
+        const verifiedUser = await getVerifiedSessionUser(req);
+        if (!verifiedUser) {
+            return res.status(401).json({ error: "Unauthorized: missing or invalid authentication." });
+        }
+        req.user = verifiedUser;
+        return next();
+    } catch (error) {
+        console.error("verifyToken failed:", error);
+        return res.status(500).json({ error: "Authentication failed." });
+    }
+}
+
+function verifyRole(requiredRole) {
+    return async (req, res, next) => {
+        try {
+            if (!req.user) {
+                const verifiedUser = await getVerifiedSessionUser(req);
+                if (!verifiedUser) {
+                    return res.status(401).json({ error: "Unauthorized: missing or invalid authentication." });
+                }
+                req.user = verifiedUser;
+            }
+
+            if (req.user.role !== requiredRole) {
+                return res.status(403).json({ error: "Forbidden: insufficient role." });
+            }
+
+            return next();
+        } catch (error) {
+            console.error(`verifyRole(${requiredRole}) failed:`, error);
+            return res.status(500).json({ error: "Authorization failed." });
+        }
+    };
+}
+
+async function verifyStudent(req, res, next) {
+    return verifyRole("student")(req, res, next);
+}
+
+async function verifyTutor(req, res, next) {
+    return verifyRole("tutor")(req, res, next);
+}
+
+async function verifyAdmin(req, res, next) {
+    return verifyRole("admin")(req, res, next);
+}
+
+// Backward-compatible helpers for any remaining internal use.
+async function getAuthenticatedTutor(req) {
+    const verifiedUser = req.user || await getVerifiedSessionUser(req);
+    if (!verifiedUser || verifiedUser.role !== "tutor") return null;
+    return { userId: verifiedUser.userId, name: verifiedUser.name, email: verifiedUser.email };
+}
+
+async function getAuthenticatedUser(req) {
+    return req.user || getVerifiedSessionUser(req);
 }
 
 function cleanText(value) {
@@ -307,8 +336,14 @@ app.get('/tution-post', async (req, res) => {
             ];
         }
 
-        if (subject) query.subject = subject;
-        if (classLevel) query.classLevel = classLevel;
+        if (subject) {
+            const escapedSubject = subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            query.subject = { $regex: `^${escapedSubject}$`, $options: "i" };
+        }
+        if (classLevel) {
+            const escapedClassLevel = classLevel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            query.classLevel = { $regex: `^${escapedClassLevel}$`, $options: "i" };
+        }
         if (mode === "online" || mode === "offline") query.mode = mode;
 
         const result = await tution.find(query).toArray();
@@ -324,24 +359,19 @@ app.get('/tution-post', async (req, res) => {
 });
 
 // Tutor-scoped read used by the "My Tuitions" page.
-app.get('/tution-post/my', async (req, res) => {
+app.get('/tution-post/my', verifyTutor, async (req, res) => {
     try {
-        const tutor = await getAuthenticatedTutor(req);
-        if (!tutor) {
-            return res.status(401).json({ error: "Please sign in as a tutor." });
-        }
-
         // Ownership comes only from the authenticated session. Match both the current
         // string tutorId and legacy ObjectId/email variants so older own posts are
         // not silently omitted. No approval, active, or tutor-status filter is used.
-        const tutorId = String(tutor.userId);
+        const tutorId = String(req.user.userId);
         const ownerClauses = [{ tutorId }];
 
         if (ObjectId.isValid(tutorId)) {
             ownerClauses.push({ tutorId: new ObjectId(tutorId) });
         }
 
-        const tutorEmail = cleanText(tutor.email);
+        const tutorEmail = cleanText(req.user.email);
         if (tutorEmail) {
             const escapedEmail = tutorEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             ownerClauses.push({
@@ -430,15 +460,9 @@ app.get('/tution-post/:id', async (req, res) => {
 });
 
 // Student application. Identity and role always come from the verified session.
-app.post('/tution-post/:id/apply', async (req, res) => {
+app.post('/tution-post/:id/apply', verifyStudent, async (req, res) => {
     try {
-        const applicant = await getAuthenticatedUser(req);
-        if (!applicant) {
-            return res.status(401).json({ error: "Please sign in to apply for a tuition." });
-        }
-        if (applicant.role !== "student") {
-            return res.status(403).json({ error: "Only students can apply for tuition." });
-        }
+        const applicant = req.user;
 
         const { id } = req.params;
         const isValidId = /^[0-9a-fA-F]{24}$/.test(id) && ObjectId.isValid(id);
@@ -520,15 +544,9 @@ app.post('/tution-post/:id/apply', async (req, res) => {
 });
 
 // Applications belonging to the authenticated student, joined with live tuition data.
-app.get('/application/my', async (req, res) => {
+app.get('/application/my', verifyStudent, async (req, res) => {
     try {
-        const student = await getAuthenticatedUser(req);
-        if (!student) {
-            return res.status(401).json({ error: "Please sign in to view your applications." });
-        }
-        if (student.role !== "student") {
-            return res.status(403).json({ error: "Only students can view applications." });
-        }
+        const student = req.user;
 
         const docs = await application
             .find(
@@ -598,15 +616,9 @@ app.get('/application/my', async (req, res) => {
 });
 
 // Students may cancel only their own pending applications.
-app.delete('/application/:id', async (req, res) => {
+app.delete('/application/:id', verifyStudent, async (req, res) => {
     try {
-        const student = await getAuthenticatedUser(req);
-        if (!student) {
-            return res.status(401).json({ error: "Please sign in to cancel an application." });
-        }
-        if (student.role !== "student") {
-            return res.status(403).json({ error: "Only students can cancel applications." });
-        }
+        const student = req.user;
 
         const { id } = req.params;
         if (!/^[0-9a-fA-F]{24}$/.test(id) || !ObjectId.isValid(id)) {
@@ -641,12 +653,9 @@ app.delete('/application/:id', async (req, res) => {
     }
 });
 
-app.post('/tution-post', async (req, res) => {
+app.post('/tution-post', verifyTutor, async (req, res) => {
     try {
-        const tutor = await getAuthenticatedTutor(req);
-        if (!tutor) {
-            return res.status(401).json({ error: "Please sign in as a tutor to post a tuition." });
-        }
+        const tutor = req.user;
 
         const { errors, value } = validateTuition(req.body || {});
         if (errors.length > 0) {
@@ -687,15 +696,9 @@ app.post('/tution-post', async (req, res) => {
     }
 })
 // Delete tuition post
-app.delete('/tution-post/:id', async (req, res) => {
+app.delete('/tution-post/:id', verifyTutor, async (req, res) => {
     try {
-        const tutor = await getAuthenticatedTutor(req);
-
-        if (!tutor) {
-            return res.status(401).json({
-                error: "Please sign in as a tutor."
-            });
-        }
+        const tutor = req.user;
 
         const { id } = req.params;
 
@@ -730,12 +733,9 @@ app.delete('/tution-post/:id', async (req, res) => {
 });
 
 
-app.patch('/tution-post/:id', async (req, res) => {
+app.patch('/tution-post/:id', verifyTutor, async (req, res) => {
     try {
-        const tutor = await getAuthenticatedTutor(req);
-        if (!tutor) {
-            return res.status(401).json({ error: "Please sign in as a tutor." });
-        }
+        const tutor = req.user;
 
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {

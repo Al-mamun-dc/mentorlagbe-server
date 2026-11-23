@@ -978,41 +978,6 @@ app.post('/tution-post', verifyTutor, async (req, res) => {
     }
 })
 // Delete tuition post
-app.delete('/tution-post/:id', verifyTutor, async (req, res) => {
-    try {
-        const tutor = req.user;
-
-        const { id } = req.params;
-
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({
-                error: "Invalid tuition ID."
-            });
-        }
-
-        const result = await tution.deleteOne({
-            _id: new ObjectId(id),
-            tutorId: tutor.userId
-        });
-
-        if (result.deletedCount === 0) {
-            return res.status(404).json({
-                error: "Tuition not found or you are not the owner."
-            });
-        }
-
-        res.status(200).json({
-            message: "Tuition post deleted successfully."
-        });
-
-    } catch (error) {
-        console.error("Delete tuition failed:", error);
-
-        res.status(500).json({
-            error: "Failed to delete tuition."
-        });
-    }
-});
 
 
 app.patch('/tution-post/:id', verifyTutor, async (req, res) => {

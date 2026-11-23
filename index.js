@@ -3,6 +3,7 @@ import { MongoClient, ObjectId } from 'mongodb';
 import "dotenv/config";
 import cors from "cors";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -16,6 +17,7 @@ app.use(cors({
         return callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
 app.use((error, req, res, next) => {
@@ -60,6 +62,12 @@ try {
 }
 
 const FREE_POST_LIMIT = 2;
+
+const AUTH_BASE_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/+$/, "");
+const AUTH_JWKS_URL = process.env.BETTER_AUTH_JWKS_URL || `${AUTH_BASE_URL}/api/auth/jwks`;
+const AUTH_ISSUER = process.env.BETTER_AUTH_JWT_ISSUER || AUTH_BASE_URL;
+const AUTH_AUDIENCE = process.env.BETTER_AUTH_JWT_AUDIENCE || AUTH_BASE_URL;
+const JWKS = createRemoteJWKSet(new URL(AUTH_JWKS_URL));
 
 function parseCookies(cookieHeader = "") {
     const cookies = Object.create(null);
@@ -114,21 +122,7 @@ function getSignedSessionToken(req) {
     return token;
 }
 
-/* Shared Better Auth session verification. Never trust frontend-supplied
-   userId/email/role; identity and role come from the verified session + DB. */
-async function getVerifiedSessionUser(req) {
-    const token = getSignedSessionToken(req);
-    if (!token) return null;
-
-    const activeSession = await session.findOne({ token });
-    if (!activeSession) return null;
-
-    const expiresAt = new Date(activeSession.expiresAt).getTime();
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-        return null;
-    }
-
-    const userId = String(activeSession.userId);
+async function getUserById(userId) {
     if (!/^[0-9a-fA-F]{24}$/.test(userId) || !ObjectId.isValid(userId)) {
         return null;
     }
@@ -146,20 +140,101 @@ async function getVerifiedSessionUser(req) {
     if (!account) return null;
 
     return {
-        userId,
+        userId: String(account._id),
         name: cleanText(account.name),
         email: cleanText(account.email),
         role: cleanText(account.role),
     };
 }
 
+/* Shared Better Auth session verification. Never trust frontend-supplied
+   userId/email/role; identity and role come from the verified session + DB. */
+async function getVerifiedSessionUser(req) {
+    const token = getSignedSessionToken(req);
+    if (!token) return null;
+
+    const activeSession = await session.findOne({ token });
+    if (!activeSession) return null;
+
+    const expiresAt = new Date(activeSession.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        return null;
+    }
+
+    return getUserById(String(activeSession.userId));
+}
+
+function getBearerToken(req) {
+    const header = req.headers.authorization;
+    if (typeof header !== "string" || !header.trim()) {
+        return { kind: "none" };
+    }
+
+    const [scheme, ...rest] = header.trim().split(/\s+/);
+    if (scheme !== "Bearer" || rest.length !== 1 || !rest[0]) {
+        return { kind: "invalid" };
+    }
+
+    return { kind: "bearer", token: rest[0] };
+}
+
+async function getVerifiedJwtUser(req) {
+    const bearer = getBearerToken(req);
+    if (bearer.kind === "none") return { kind: "none" };
+    if (bearer.kind === "invalid") return { kind: "invalid" };
+
+    let payload;
+    try {
+        ({ payload } = await jwtVerify(bearer.token, JWKS, {
+            issuer: AUTH_ISSUER,
+            audience: AUTH_AUDIENCE,
+        }));
+    } catch {
+        return { kind: "invalid" };
+    }
+
+    const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
+    if (!sub) return { kind: "invalid" };
+
+    // Current role always comes from MongoDB, never from JWT claims.
+    const account = await getUserById(sub);
+    if (!account) return { kind: "invalid" };
+
+    return { kind: "ok", user: account };
+}
+
+async function authenticateRequest(req) {
+    if (req.user) return { ok: true, user: req.user };
+
+    const bearer = getBearerToken(req);
+    if (bearer.kind !== "none") {
+        const jwtUser = await getVerifiedJwtUser(req);
+        if (jwtUser.kind === "ok") return { ok: true, user: jwtUser.user };
+        return {
+            ok: false,
+            status: 401,
+            error: "Unauthorized: missing or invalid authentication.",
+        };
+    }
+
+    // Backward-compatible cookie fallback for existing session-based clients.
+    const sessionUser = await getVerifiedSessionUser(req);
+    if (sessionUser) return { ok: true, user: sessionUser };
+
+    return {
+        ok: false,
+        status: 401,
+        error: "Unauthorized: missing or invalid authentication.",
+    };
+}
+
 async function verifyToken(req, res, next) {
     try {
-        const verifiedUser = await getVerifiedSessionUser(req);
-        if (!verifiedUser) {
-            return res.status(401).json({ error: "Unauthorized: missing or invalid authentication." });
+        const authResult = await authenticateRequest(req);
+        if (!authResult.ok) {
+            return res.status(authResult.status).json({ error: authResult.error });
         }
-        req.user = verifiedUser;
+        req.user = authResult.user;
         return next();
     } catch (error) {
         console.error("verifyToken failed:", error);
@@ -170,13 +245,11 @@ async function verifyToken(req, res, next) {
 function verifyRole(requiredRole) {
     return async (req, res, next) => {
         try {
-            if (!req.user) {
-                const verifiedUser = await getVerifiedSessionUser(req);
-                if (!verifiedUser) {
-                    return res.status(401).json({ error: "Unauthorized: missing or invalid authentication." });
-                }
-                req.user = verifiedUser;
+            const authResult = await authenticateRequest(req);
+            if (!authResult.ok) {
+                return res.status(authResult.status).json({ error: authResult.error });
             }
+            req.user = authResult.user;
 
             if (req.user.role !== requiredRole) {
                 return res.status(403).json({ error: "Forbidden: insufficient role." });
@@ -204,13 +277,15 @@ async function verifyAdmin(req, res, next) {
 
 // Backward-compatible helpers for any remaining internal use.
 async function getAuthenticatedTutor(req) {
-    const verifiedUser = req.user || await getVerifiedSessionUser(req);
+    const authResult = await authenticateRequest(req);
+    const verifiedUser = authResult.ok ? authResult.user : null;
     if (!verifiedUser || verifiedUser.role !== "tutor") return null;
     return { userId: verifiedUser.userId, name: verifiedUser.name, email: verifiedUser.email };
 }
 
 async function getAuthenticatedUser(req) {
-    return req.user || getVerifiedSessionUser(req);
+    const authResult = await authenticateRequest(req);
+    return authResult.ok ? authResult.user : null;
 }
 
 function cleanText(value) {

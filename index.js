@@ -1015,6 +1015,49 @@ app.delete('/tution-post/:id', verifyTutor, async (req, res) => {
 });
 
 
+app.patch('/tution-post/:id', verifyTutor, async (req, res) => {
+    try {
+        const tutor = req.user;
+
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const objectId = new ObjectId(id);
+        const existing = await tution.findOne({
+            _id: objectId,
+            tutorId: tutor.userId
+        });
+
+        if (!existing) {
+            return res.status(404).json({
+                error: "Tuition not found or you are not the owner."
+            });
+        }
+
+        const { errors, value } = validateTuition(
+            { ...existing, ...req.body },
+            false
+        );
+        if (errors.length > 0) {
+            return res.status(400).json({ error: errors.join(" ") });
+        }
+
+        const { bannerImage: _bannerImage, ...updates } = value;
+        await tution.updateOne(
+            { _id: objectId, tutorId: tutor.userId },
+            { $set: { ...updates, updatedAt: new Date() } }
+        );
+
+        res.send({ message: "Tuition updated successfully." });
+
+    } catch (error) {
+        console.error("Update tuition failed:", error);
+        res.status(500).json({ error: "Failed to update tuition." });
+    }
+});
+
 app.listen(port, () => {
     console.log(`mentorlagbe runing on port ${port}`);
 });

@@ -1058,3 +1058,6 @@ app.patch('/tution-post/:id', verifyTutor, async (req, res) => {
     }
 });
 
+app.listen(port, () => {
+    console.log(`mentorlagbe runing on port ${port}`);
+});

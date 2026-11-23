@@ -49,6 +49,8 @@ const session = database.collection("session");
 const tutorPlan = database.collection("tutorPlan");
 // Student applications are stored separately from tuition posts.
 const application = database.collection("application");
+// Student bookmarks are stored separately; one bookmark per student per tuition.
+const bookmark = database.collection("bookmark");
 
 // One application per student per tuition, even if two requests arrive together.
 // If legacy duplicates exist, log the problem but keep the server available.
@@ -61,7 +63,17 @@ try {
     console.error("Unable to create application unique index:", error);
 }
 
+try {
+    await bookmark.createIndex(
+        { studentId: 1, tuitionId: 1 },
+        { unique: true, name: "studentId_1_tuitionId_1" }
+    );
+} catch (error) {
+    console.error("Unable to create bookmark unique index:", error);
+}
+
 const FREE_POST_LIMIT = 2;
+const FREE_BOOKMARK_LIMIT = 5;
 
 const AUTH_BASE_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/+$/, "");
 const AUTH_JWKS_URL = process.env.BETTER_AUTH_JWKS_URL || `${AUTH_BASE_URL}/api/auth/jwks`;
@@ -551,10 +563,22 @@ app.post('/tution-post/:id/apply', verifyStudent, async (req, res) => {
                 approvalStatus: "approved",
                 isActive: true
             },
-            { projection: { title: 1 } }
+            { projection: { title: 1, tutorEmail: 1, tutorId: 1 } }
         );
         if (!tuitionDoc) {
             return res.status(404).json({ error: "Tuition not found or no longer available." });
+        }
+
+        let tutorEmail = cleanText(tuitionDoc.tutorEmail);
+        if (!tutorEmail) {
+            const tutorId = cleanText(tuitionDoc.tutorId);
+            if (/^[0-9a-fA-F]{24}$/.test(tutorId) && ObjectId.isValid(tutorId)) {
+                const tutorAccount = await user.findOne(
+                    { _id: new ObjectId(tutorId) },
+                    { projection: { email: 1 } }
+                );
+                tutorEmail = cleanText(tutorAccount?.email);
+            }
         }
 
         const phone = cleanText(req.body?.phone);
@@ -583,10 +607,10 @@ app.post('/tution-post/:id/apply', verifyStudent, async (req, res) => {
             return res.status(409).json({ error: "You have already applied for this tuition." });
         }
 
-        // Tuition details are joined from the tution collection when read,
-        // so they are intentionally not duplicated in this document.
+        // Store key application fields explicitly; tuition title remains joined on read.
         const applicationData = {
             tuitionId: id,
+            tutorEmail,
             studentId: applicant.userId,
             studentName: applicant.name,
             studentEmail: applicant.email,
@@ -728,6 +752,189 @@ app.delete('/application/:id', verifyStudent, async (req, res) => {
     }
 });
 
+// Returns bookmarked tuition IDs for the authenticated student.
+app.get('/bookmarks/ids', verifyStudent, async (req, res) => {
+    try {
+        const student = req.user;
+        const docs = await bookmark
+            .find({ studentId: student.userId }, { projection: { tuitionId: 1, _id: 0 } })
+            .toArray();
+        res.status(200).json({
+            tuitionIds: docs.map((doc) => String(doc.tuitionId || "")).filter(Boolean),
+        });
+    } catch (error) {
+        console.error("GET /bookmarks/ids failed:", error);
+        res.status(500).json({ error: "Failed to load bookmarks." });
+    }
+});
+
+// Returns the authenticated student's bookmarked tuitions with live tuition data.
+app.get('/bookmarks/my', verifyStudent, async (req, res) => {
+    try {
+        const student = req.user;
+        const docs = await bookmark
+            .find({ studentId: student.userId }, { sort: { createdAt: -1 } })
+            .toArray();
+
+        const tuitionIds = [
+            ...new Set(
+                docs
+                    .map((doc) => String(doc.tuitionId || ""))
+                    .filter((id) => /^[0-9a-fA-F]{24}$/.test(id) && ObjectId.isValid(id))
+            ),
+        ];
+
+        const tuitionDocs = tuitionIds.length
+            ? await tution
+                .find(
+                    { _id: { $in: tuitionIds.map((id) => new ObjectId(id)) } },
+                    {
+                        projection: {
+                            title: 1,
+                            subject: 1,
+                            classLevel: 1,
+                            mode: 1,
+                            location: 1,
+                            monthlyFee: 1,
+                            daysPerWeek: 1,
+                            description: 1,
+                            bannerImage: 1,
+                            tutorName: 1,
+                            tutorEmail: 1,
+                        },
+                    }
+                )
+                .toArray()
+            : [];
+        const tuitionById = new Map(tuitionDocs.map((doc) => [String(doc._id), doc]));
+
+        const bookmarks = docs.map((doc) => {
+            const tuitionId = String(doc.tuitionId || "");
+            const tuition = tuitionById.get(tuitionId);
+            const mode = cleanText(tuition?.mode).toLowerCase() === "offline" ? "offline" : "online";
+            const fee = Number(tuition?.monthlyFee);
+            const days = Number(tuition?.daysPerWeek);
+
+            return {
+                id: String(doc._id),
+                tuitionId,
+                createdAt: toIsoString(doc.createdAt),
+                tuition: tuition ? {
+                    id: String(tuition._id),
+                    title: cleanText(tuition.title) || "Untitled tuition",
+                    subject: cleanText(tuition.subject),
+                    classLevel: cleanText(tuition.classLevel),
+                    mode,
+                    location: mode === "online" ? "Online" : cleanText(tuition.location),
+                    monthlyFee: Number.isFinite(fee) ? fee : 0,
+                    daysPerWeek: Number.isInteger(days) && days >= 1 && days <= 7 ? days : 1,
+                    description: cleanText(tuition.description),
+                    bannerImage: cleanText(tuition.bannerImage),
+                    tutorName: cleanText(tuition.tutorName),
+                    tutorEmail: cleanText(tuition.tutorEmail),
+                } : null,
+            };
+        });
+
+        res.status(200).json({ bookmarks });
+    } catch (error) {
+        console.error("GET /bookmarks/my failed:", error);
+        res.status(500).json({ error: "Failed to load bookmarks." });
+    }
+});
+
+async function getUserPlanFromDb(userId) {
+    if (!/^[0-9a-fA-F]{24}$/.test(userId) || !ObjectId.isValid(userId)) return "free";
+    const account = await user.findOne(
+        { _id: new ObjectId(userId) },
+        { projection: { plan: 1 } }
+    );
+    return account?.plan === "pro" ? "pro" : "free";
+}
+
+// Student bookmark. Plan limit is enforced from the database, never from client input.
+app.post('/bookmarks/:tuitionId', verifyStudent, async (req, res) => {
+    try {
+        const student = req.user;
+        const { tuitionId } = req.params;
+        if (!/^[0-9a-fA-F]{24}$/.test(tuitionId) || !ObjectId.isValid(tuitionId)) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const tuitionDoc = await tution.findOne(
+            { _id: new ObjectId(tuitionId) },
+            { projection: { _id: 1 } }
+        );
+        if (!tuitionDoc) {
+            return res.status(404).json({ error: "Tuition not found." });
+        }
+
+        const existing = await bookmark.findOne({ studentId: student.userId, tuitionId });
+        if (existing) {
+            return res.status(409).json({ error: "You have already bookmarked this tuition." });
+        }
+
+        const plan = await getUserPlanFromDb(student.userId);
+        if (plan !== "pro") {
+            const bookmarkCount = await bookmark.countDocuments({ studentId: student.userId });
+            if (bookmarkCount >= FREE_BOOKMARK_LIMIT) {
+                return res.status(403).json({
+                    error: `Free plan allows a maximum of ${FREE_BOOKMARK_LIMIT} bookmarked tuitions. Upgrade to Pro for unlimited bookmarks.`,
+                });
+            }
+        }
+
+        const bookmarkData = {
+            studentId: student.userId,
+            tuitionId,
+            createdAt: new Date(),
+        };
+
+        try {
+            const inserted = await bookmark.insertOne(bookmarkData);
+            if (plan !== "pro") {
+                const totalAfterInsert = await bookmark.countDocuments({ studentId: student.userId });
+                if (totalAfterInsert > FREE_BOOKMARK_LIMIT) {
+                    await bookmark.deleteOne({ _id: inserted.insertedId, studentId: student.userId });
+                    return res.status(403).json({
+                        error: `Free plan allows a maximum of ${FREE_BOOKMARK_LIMIT} bookmarked tuitions. Upgrade to Pro for unlimited bookmarks.`,
+                    });
+                }
+            }
+            return res.status(201).json({ id: String(inserted.insertedId), ...bookmarkData });
+        } catch (error) {
+            if (error && error.code === 11000) {
+                return res.status(409).json({ error: "You have already bookmarked this tuition." });
+            }
+            throw error;
+        }
+    } catch (error) {
+        console.error("POST /bookmarks/:tuitionId failed:", error);
+        res.status(500).json({ error: "Failed to bookmark tuition." });
+    }
+});
+
+// Removes a bookmark owned by the authenticated student.
+app.delete('/bookmarks/:tuitionId', verifyStudent, async (req, res) => {
+    try {
+        const student = req.user;
+        const { tuitionId } = req.params;
+        if (!/^[0-9a-fA-F]{24}$/.test(tuitionId) || !ObjectId.isValid(tuitionId)) {
+            return res.status(400).json({ error: "Invalid tuition ID." });
+        }
+
+        const result = await bookmark.deleteOne({ studentId: student.userId, tuitionId });
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ error: "Bookmark not found." });
+        }
+
+        res.status(200).json({ message: "Bookmark removed successfully." });
+    } catch (error) {
+        console.error("DELETE /bookmarks/:tuitionId failed:", error);
+        res.status(500).json({ error: "Failed to remove bookmark." });
+    }
+});
+
 app.post('/tution-post', verifyTutor, async (req, res) => {
     try {
         const tutor = req.user;
@@ -851,6 +1058,3 @@ app.patch('/tution-post/:id', verifyTutor, async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`mentorlagbe runing on port ${port}`);
-});

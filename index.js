@@ -753,20 +753,6 @@ app.delete('/application/:id', verifyStudent, async (req, res) => {
 });
 
 // Returns bookmarked tuition IDs for the authenticated student.
-app.get('/bookmarks/ids', verifyStudent, async (req, res) => {
-    try {
-        const student = req.user;
-        const docs = await bookmark
-            .find({ studentId: student.userId }, { projection: { tuitionId: 1, _id: 0 } })
-            .toArray();
-        res.status(200).json({
-            tuitionIds: docs.map((doc) => String(doc.tuitionId || "")).filter(Boolean),
-        });
-    } catch (error) {
-        console.error("GET /bookmarks/ids failed:", error);
-        res.status(500).json({ error: "Failed to load bookmarks." });
-    }
-});
 
 // Returns the authenticated student's bookmarked tuitions with live tuition data.
 app.get('/bookmarks/my', verifyStudent, async (req, res) => {

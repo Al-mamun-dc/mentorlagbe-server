@@ -9,15 +9,34 @@ const app = express();
 const port = process.env.PORT || 4000;
 
 //midleware
+const allowedOrigins = (process.env.CLIENT_URLS || process.env.CLIENT_URL || "")
+    .split(",")
+    .map((value) => value.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+
+const allowedOriginPatterns = [
+    /^https:\/\/mentorlagbe-client(?:-[a-z0-9]+)*\.vercel\.app$/i,
+];
+
+function isAllowedOrigin(origin) {
+    if (!origin) return true;
+    const normalizedOrigin = origin.replace(/\/+$/, "");
+    if (/^http:\/\/(localhost|127\.0\.0\.1):3000$/.test(normalizedOrigin)) return true;
+    if (allowedOrigins.includes(normalizedOrigin)) return true;
+    return allowedOriginPatterns.some((pattern) => pattern.test(normalizedOrigin));
+}
+
 app.use(cors({
     origin(origin, callback) {
-        if (!origin || /^http:\/\/(localhost|127\.0\.0\.1):3000$/.test(origin)) {
+        if (isAllowedOrigin(origin)) {
             return callback(null, true);
         }
-        return callback(new Error("Not allowed by CORS"));
+        return callback(null, false);
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
 }));
 app.use(express.json());
 app.use((error, req, res, next) => {
@@ -28,54 +47,76 @@ app.use((error, req, res, next) => {
 });
 const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-gewkcdw-shard-00-00.tlv5tmv.mongodb.net:27017,ac-gewkcdw-shard-00-01.tlv5tmv.mongodb.net:27017,ac-gewkcdw-shard-00-02.tlv5tmv.mongodb.net:27017/?ssl=true&replicaSet=atlas-6gpape-shard-0&authSource=admin`);
 
-export async function connectToMongoDB() {
+let database;
+let user;
+let tution;
+let session;
+// Plans live separately so the existing user collection is never changed.
+let tutorPlan;
+// Student applications are stored separately from tuition posts.
+let application;
+// Student bookmarks are stored separately; one bookmark per student per tuition.
+let bookmark;
+let dbReadyPromise = null;
+
+async function initializeDb() {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
+
+    database = client.db("mentorlagbe");
+    user = database.collection("user");
+    tution = database.collection("tution");
+    session = database.collection("session");
+    tutorPlan = database.collection("tutorPlan");
+    application = database.collection("application");
+    bookmark = database.collection("bookmark");
+
+    // One application per student per tuition, even if two requests arrive together.
+    // If legacy duplicates exist, log the problem but keep the server available.
+    try {
+        await application.createIndex(
+            { studentId: 1, tuitionId: 1 },
+            { unique: true, name: "studentId_1_tuitionId_1" }
+        );
+    } catch (error) {
+        console.error("Unable to create application unique index:", error);
+    }
+
+    try {
+        await bookmark.createIndex(
+            { studentId: 1, tuitionId: 1 },
+            { unique: true, name: "studentId_1_tuitionId_1" }
+        );
+    } catch (error) {
+        console.error("Unable to create bookmark unique index:", error);
+    }
+}
+
+async function ensureDb() {
+    if (dbReadyPromise) return dbReadyPromise;
+
+    dbReadyPromise = initializeDb().catch((error) => {
+        dbReadyPromise = null;
+        console.error("Unable to initialize MentorLagbe backend: MongoDB is unavailable.", error);
+        throw error;
+    });
+
+    return dbReadyPromise;
+}
+
+export async function connectToMongoDB() {
+    await ensureDb();
     return client;
-}
-
-let connectedClient;
-try {
-    connectedClient = await connectToMongoDB();
-} catch (error) {
-    console.error("Unable to start MentorLagbe backend: MongoDB is unavailable.", error);
-    process.exit(1);
-}
-const database = connectedClient.db("mentorlagbe");
-const user = database.collection("user");
-const tution = database.collection("tution");
-const session = database.collection("session");
-// Plans live separately so the existing user collection is never changed.
-const tutorPlan = database.collection("tutorPlan");
-// Student applications are stored separately from tuition posts.
-const application = database.collection("application");
-// Student bookmarks are stored separately; one bookmark per student per tuition.
-const bookmark = database.collection("bookmark");
-
-// One application per student per tuition, even if two requests arrive together.
-// If legacy duplicates exist, log the problem but keep the server available.
-try {
-    await application.createIndex(
-        { studentId: 1, tuitionId: 1 },
-        { unique: true, name: "studentId_1_tuitionId_1" }
-    );
-} catch (error) {
-    console.error("Unable to create application unique index:", error);
-}
-
-try {
-    await bookmark.createIndex(
-        { studentId: 1, tuitionId: 1 },
-        { unique: true, name: "studentId_1_tuitionId_1" }
-    );
-} catch (error) {
-    console.error("Unable to create bookmark unique index:", error);
 }
 
 const FREE_POST_LIMIT = 2;
 const FREE_BOOKMARK_LIMIT = 5;
 
-const AUTH_BASE_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/+$/, "");
+const PRODUCTION_FRONTEND_URL = "https://mentorlagbe-client-cibnsxevo-acme-a4b7.vercel.app";
+const AUTH_BASE_URL = (
+    process.env.BETTER_AUTH_URL ||
+    (process.env.VERCEL ? PRODUCTION_FRONTEND_URL : "https://mentorlagbe-client-cibnsxevo-acme-a4b7.vercel.app")
+).replace(/\/+$/, "");
 const AUTH_JWKS_URL = process.env.BETTER_AUTH_JWKS_URL || `${AUTH_BASE_URL}/api/auth/jwks`;
 const AUTH_ISSUER = process.env.BETTER_AUTH_JWT_ISSUER || AUTH_BASE_URL;
 const AUTH_AUDIENCE = process.env.BETTER_AUTH_JWT_AUDIENCE || AUTH_BASE_URL;
@@ -201,16 +242,23 @@ async function getVerifiedJwtUser(req) {
             issuer: AUTH_ISSUER,
             audience: AUTH_AUDIENCE,
         }));
-    } catch {
+    } catch (error) {
+        console.warn("JWT verification failed:", error instanceof Error ? error.message : "unknown");
         return { kind: "invalid" };
     }
 
     const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
-    if (!sub) return { kind: "invalid" };
+    if (!sub) {
+        console.warn("JWT verification failed: missing subject");
+        return { kind: "invalid" };
+    }
 
     // Current role always comes from MongoDB, never from JWT claims.
     const account = await getUserById(sub);
-    if (!account) return { kind: "invalid" };
+    if (!account) {
+        console.warn("JWT verification failed: subject user not found");
+        return { kind: "invalid" };
+    }
 
     return { kind: "ok", user: account };
 }
@@ -377,6 +425,17 @@ function validateTuition(body, requireBannerImage = true) {
 
 app.get('/', (req, res) => {
     res.send('hello');
+});
+
+// All routes below depend on MongoDB collections/indexes. Keep GET / above this middleware.
+app.use(async (req, res, next) => {
+    try {
+        await ensureDb();
+        return next();
+    } catch (error) {
+        console.error("Database initialization failed for request:", error);
+        return res.status(503).json({ error: "Database unavailable. Please try again." });
+    }
 });
 
 app.get('/users', async (req, res) => {
@@ -1058,6 +1117,10 @@ app.patch('/tution-post/:id', verifyTutor, async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`mentorlagbe runing on port ${port}`);
-});
+if (!process.env.VERCEL) {
+    app.listen(port, () => {
+        console.log(`mentorlagbe runing on port ${port}`);
+    });
+}
+
+export default app;
